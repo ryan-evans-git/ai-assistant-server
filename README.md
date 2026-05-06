@@ -1,9 +1,14 @@
 # ai-assistant-server
 
-A generic [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
-server. Drop OpenAPI / Swagger spec files into `tools/` and every operation
-becomes an MCP tool — names, descriptions, JSON-Schema inputs, base URLs,
-and auth requirements are all derived from the spec.
+A spec-driven [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
+server. Drop OpenAPI 3.x / Swagger 2.0 spec files into `tools/` and every
+operation becomes an MCP tool — names, descriptions, JSON-Schema inputs,
+base URLs, and auth requirements are all derived from the spec.
+
+Built for **multi-tenant** deployments: credentials can be supplied
+per-request and forwarded to the upstream API on the caller's behalf,
+keyed by the spec's `securitySchemes`. No shared service-account leaks
+between tenants. Speaks both stdio and SSE MCP transports.
 
 No code changes to add a new tool. Just drop in the spec.
 

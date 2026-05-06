@@ -1,7 +1,7 @@
 [project]
 name = "ai-assistant-server"
 version = "0.1.0"
-description = "Generic MCP server that auto-loads tools from OpenAPI/Swagger specs."
+description = "OpenAPI/Swagger-driven MCP server with per-request credential forwarding for multi-tenant deployments. Drop a spec into tools/ and every operation becomes a typed MCP tool over stdio or SSE."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

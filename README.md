@@ -1,0 +1,177 @@
+# ai-assistant-server
+
+A generic [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
+server. Drop OpenAPI / Swagger spec files into `tools/` and every operation
+becomes an MCP tool — names, descriptions, JSON-Schema inputs, base URLs,
+and auth requirements are all derived from the spec.
+
+No code changes to add a new tool. Just drop in the spec.
+
+```
+tools/
+  petstore.yaml          ← https://petstore3.swagger.io/api/v3
+  github.yaml            ← bearer-auth, env-mapped
+  internal-api.yaml      ← your private API
+```
+
+## Why
+
+Most MCP servers couple a server's plumbing to a particular API's shape.
+That makes them hard to reuse across projects. This server inverts the
+relationship: the **spec** is the source of truth. The Python code is a
+thin adapter that knows how to:
+
+1. **Load** OpenAPI 3.x (and Swagger 2.0) documents.
+2. **Project** each operation into an MCP `Tool` (name, description,
+   `inputSchema`).
+3. **Execute** tool calls as upstream HTTP requests, with auth supplied
+   from environment variables or per-request forwarded credentials.
+
+Add an API by writing — or downloading — its OpenAPI spec.
+
+## Install
+
+```bash
+pip install git+https://github.com/ryan-evans-git/ai-assistant-server.git
+```
+
+Or clone and install in editable mode for local development:
+
+```bash
+git clone https://github.com/ryan-evans-git/ai-assistant-server.git
+cd ai-assistant-server
+pip install -e ".[dev]"
+```
+
+Python 3.11+ required.
+
+## Quickstart
+
+```bash
+# Use the bundled sample specs (Petstore + JSONPlaceholder + GitHub).
+ai-assistant-server --tools-dir ./tools
+
+# Or run via Docker:
+docker build -t ai-assistant-server .
+docker run -p 8765:8765 -v $(pwd)/tools:/app/tools ai-assistant-server
+```
+
+By default the server speaks MCP over **stdio** — the right transport for
+Claude Desktop, Claude Code, and any subprocess-based MCP host. To expose
+it over HTTP+SSE for remote hosts:
+
+```bash
+ai-assistant-server --transport sse --port 8765
+```
+
+## Adding a new tool
+
+1. Save the API's OpenAPI document as `tools/<name>.yaml` (or `.json`).
+2. Restart the server.
+
+That's it. The loader will:
+
+- Read every `paths.{path}.{method}` entry as a tool.
+- Use `operationId` as the tool name (or fall back to `{method}_{path}`).
+- Combine `summary` and `description` into the tool's description.
+- Synthesize a JSON-Schema `inputSchema` from `parameters` + `requestBody`.
+- Pick the first server URL from `servers[]` as the base URL.
+- Resolve security requirements against `components.securitySchemes`.
+
+## Auth
+
+The server supports the OpenAPI security schemes that can be auto-resolved
+from credentials at request time:
+
+| OpenAPI spec | What you set |
+|---|---|
+| `type: http` + `scheme: bearer` | `AI_ASSISTANT_SERVER_AUTH_<schemeName>=<token>` |
+| `type: http` + `scheme: basic` | `AI_ASSISTANT_SERVER_AUTH_<schemeName>=user:pass` (or pre-encoded base64) |
+| `type: apiKey` + `in: header` | `AI_ASSISTANT_SERVER_AUTH_<schemeName>=<key>` |
+| `type: apiKey` + `in: query` | `AI_ASSISTANT_SERVER_AUTH_<schemeName>=<key>` |
+
+`<schemeName>` is the upper-cased name from `components.securitySchemes`
+(e.g. `bearerAuth` → `AI_ASSISTANT_SERVER_AUTH_BEARERAUTH`).
+
+OAuth2 flows are surfaced as **unsupported** — they require a token-endpoint
+dance the server can't do from a spec alone. To use an OAuth2-protected
+API, mint a bearer token externally and supply it via the bearer scheme.
+
+### Forwarded credentials (per-request)
+
+When the MCP host is acting on behalf of an authenticated end-user, it
+can forward credentials per-request rather than baking them into the
+server's environment:
+
+```bash
+# stdio: env-var prefix is read at startup
+X_AI_ASSISTANT_AUTH_bearerAuth=<user-token> ai-assistant-server
+```
+
+Forwarded credentials always take priority over `AI_ASSISTANT_SERVER_AUTH_*`.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AI_ASSISTANT_SERVER_TOOLS_DIR` | `./tools` | Where to scan for specs. |
+| `AI_ASSISTANT_SERVER_TRANSPORT` | `stdio` | `stdio` or `sse`. |
+| `AI_ASSISTANT_SERVER_HOST` | `127.0.0.1` | SSE bind host. |
+| `AI_ASSISTANT_SERVER_PORT` | `8765` | SSE port. |
+| `AI_ASSISTANT_SERVER_LOG_LEVEL` | `INFO` | Logger level. |
+| `AI_ASSISTANT_SERVER_BASE_URL_OVERRIDE` | _(unset)_ | Force every tool through this URL. Useful for routing through a local proxy. |
+| `AI_ASSISTANT_SERVER_AUTH_<NAME>` | _(unset)_ | Per-scheme credential. |
+
+CLI flags override these where applicable; see `ai-assistant-server --help`.
+
+## Tool-naming rules
+
+Resolution order:
+
+1. `operationId`, slugified (lowercase, non-alphanumerics → `_`).
+2. `{method}_{path}`, same slugify.
+
+Duplicate names get a `_2`, `_3`, ... suffix in registration order so the
+server never silently shadows a tool.
+
+## Project layout
+
+```
+ai_assistant_server/
+  __init__.py        # Public API exports
+  loader.py          # OpenAPI doc → ToolDefinition list
+  executor.py        # ToolDefinition + args → upstream HTTP call
+  auth.py            # AuthConfig + ambient env → auth headers/query
+  models.py          # ToolDefinition / AuthConfig / HttpExecution
+  server.py          # MCP server entrypoint (stdio + SSE)
+
+tools/               # Drop your OpenAPI specs here
+tests/               # pytest suite
+```
+
+The packages above are deliberately small (under ~300 lines each). Every
+new feature should fit one of those slots — and if it doesn't, the right
+move is usually to extend the loader's `ToolDefinition` rather than adding
+a parallel pipeline.
+
+## Companion projects
+
+- [ai-assistant-client](https://github.com/ryan-evans-git/ai-assistant-client)
+  — streaming chat client for Claude with progressive tool discovery.
+- [ai-assistant-ui](https://github.com/ryan-evans-git/ai-assistant-ui)
+  — drop-in React chat panel.
+
+The three together compose into a complete assistant stack: the UI talks
+to the client, the client orchestrates Claude + tool calls, and tool calls
+land here.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## License
+
+MIT

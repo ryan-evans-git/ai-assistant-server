@@ -1,0 +1,65 @@
+openapi: 3.0.3
+info:
+  title: GitHub (sample, bearer-auth)
+  version: 1.0.0
+  description: |
+    A bearer-auth sample.  Drop a personal access token into
+    AI_ASSISTANT_SERVER_AUTH_BEARERAUTH (or forward it via
+    X_AI_ASSISTANT_AUTH_bearerAuth) to call these.
+servers:
+  - url: https://api.github.com
+paths:
+  /repos/{owner}/{repo}:
+    get:
+      operationId: getRepo
+      tags: [repos]
+      summary: Get a repository
+      parameters:
+        - name: owner
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: repo
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Repository
+  /repos/{owner}/{repo}/issues:
+    get:
+      operationId: listIssues
+      tags: [issues]
+      summary: List issues for a repository
+      parameters:
+        - name: owner
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: repo
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, closed, all]
+            default: open
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Array of issues
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

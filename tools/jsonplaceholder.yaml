@@ -1,0 +1,49 @@
+openapi: 3.0.3
+info:
+  title: JSONPlaceholder
+  version: 1.0.0
+  description: |
+    Free fake REST API for testing.  No auth, no rate limits.
+    Useful as a smoke test for the server's loader + executor
+    when you don't have a private API to point at.
+servers:
+  - url: https://jsonplaceholder.typicode.com
+paths:
+  /posts:
+    get:
+      operationId: listPosts
+      tags: [posts]
+      summary: List all posts
+      description: Returns the full list of placeholder posts.
+      responses:
+        "200":
+          description: Array of posts
+  /posts/{id}:
+    get:
+      operationId: getPost
+      tags: [posts]
+      summary: Get a single post by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A single post
+  /todos:
+    get:
+      operationId: listTodos
+      tags: [todos]
+      summary: List todos
+      parameters:
+        - name: userId
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter to todos owned by a specific user.
+      responses:
+        "200":
+          description: Array of todos

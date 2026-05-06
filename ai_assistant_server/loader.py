@@ -1,0 +1,441 @@
+"""OpenAPI spec → tool definition loader.
+
+Walks a directory of .yaml / .yml / .json files, parses each as
+an OpenAPI document, and emits one :class:`ToolDefinition` per
+HTTP operation.
+
+Supports OpenAPI 3.0.x and 3.1.x.  Swagger 2.0 documents are
+auto-converted at load time (we read the major fields directly —
+no external converter dependency).
+
+Tool naming
+-----------
+Preference order for the MCP tool name:
+
+1. ``operationId`` (snake_cased if it isn't already).
+2. ``{method}_{path}`` with non-alphanumerics collapsed to ``_``.
+
+If two operations resolve to the same name we suffix ``_2``,
+``_3``, etc.
+
+Auth resolution
+---------------
+Each operation's ``security`` requirement (or the document's
+top-level default) is matched against ``components.securitySchemes``
+to pick the first scheme we know how to execute.  See
+:class:`AuthScheme` for the supported set.  The actual secret
+value is *never* read from the spec — the executor reads it
+from the env var the user maps via ``AI_ASSISTANT_SERVER_AUTH_*``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Iterable
+
+import yaml
+
+from ai_assistant_server.models import (
+    AuthConfig,
+    AuthScheme,
+    HttpExecution,
+    ToolDefinition,
+)
+
+
+log = logging.getLogger(__name__)
+
+
+SUPPORTED_EXTENSIONS = (".yaml", ".yml", ".json")
+HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+
+
+def load_tools_from_directory(directory: str | Path) -> list[ToolDefinition]:
+    """Load every spec under ``directory`` and return all derived tools.
+
+    Files with unsupported extensions are skipped silently.
+    Files that fail to parse are logged at WARNING and skipped —
+    one bad spec shouldn't take down the rest of the catalog.
+    """
+    root = Path(directory)
+    if not root.is_dir():
+        raise ValueError(f"tools directory does not exist: {root}")
+
+    tools: list[ToolDefinition] = []
+    seen_names: set[str] = set()
+
+    for spec_path in sorted(root.iterdir()):
+        if spec_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        try:
+            spec = _read_spec(spec_path)
+        except Exception as err:  # noqa: BLE001
+            log.warning("Skipping %s: %s", spec_path.name, err)
+            continue
+        try:
+            for tool in _tools_from_spec(spec, source=spec_path.name):
+                tool = _disambiguate_name(tool, seen_names)
+                tools.append(tool)
+                seen_names.add(tool.name)
+        except Exception as err:  # noqa: BLE001
+            log.warning("Failed to parse %s: %s", spec_path.name, err)
+    log.info("Loaded %d tool(s) from %s", len(tools), root)
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# Spec I/O
+# ---------------------------------------------------------------------------
+
+
+def _read_spec(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        return json.loads(text)
+    return yaml.safe_load(text)
+
+
+# ---------------------------------------------------------------------------
+# Spec → tools
+# ---------------------------------------------------------------------------
+
+
+def _tools_from_spec(
+    spec: dict[str, Any], *, source: str
+) -> Iterable[ToolDefinition]:
+    base_url = _resolve_base_url(spec)
+    security_schemes = _security_schemes(spec)
+    document_security = spec.get("security", []) or []
+
+    paths = spec.get("paths") or {}
+    for path, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        # Path-level params apply to every operation under this path.
+        path_level_parameters = path_item.get("parameters", []) or []
+        for method, operation in path_item.items():
+            method_lower = method.lower()
+            if method_lower not in HTTP_METHODS:
+                continue
+            if not isinstance(operation, dict):
+                continue
+            yield _build_tool(
+                method=method_lower,
+                path=path,
+                operation=operation,
+                path_level_parameters=path_level_parameters,
+                base_url=base_url,
+                security_schemes=security_schemes,
+                document_security=document_security,
+                source=source,
+            )
+
+
+def _build_tool(
+    *,
+    method: str,
+    path: str,
+    operation: dict[str, Any],
+    path_level_parameters: list[Any],
+    base_url: str,
+    security_schemes: dict[str, dict[str, Any]],
+    document_security: list[Any],
+    source: str,
+) -> ToolDefinition:
+    name = _tool_name(operation, method, path)
+    description = _tool_description(operation)
+    parameters = list(path_level_parameters) + list(
+        operation.get("parameters", []) or []
+    )
+    request_body = operation.get("requestBody")
+    input_schema, locations, body_required = _build_input_schema(
+        parameters, request_body
+    )
+    operation_security = operation.get("security", document_security)
+    auth = _resolve_auth(operation_security, security_schemes)
+
+    execution = HttpExecution(
+        base_url=base_url,
+        method=method,
+        path=path,
+        parameter_locations=locations,
+        request_body_required=body_required,
+        request_body_property="body" if request_body else None,
+    )
+    tags_raw = operation.get("tags") or []
+    tags: tuple[str, ...] = tuple(str(t) for t in tags_raw if isinstance(t, str))
+
+    return ToolDefinition(
+        name=name,
+        description=description,
+        input_schema=input_schema,
+        execution=execution,
+        auth=auth,
+        tags=tags,
+        source_spec=source,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Naming / description
+# ---------------------------------------------------------------------------
+
+
+_NON_ALPHANUM = re.compile(r"[^a-zA-Z0-9]+")
+
+
+def _tool_name(operation: dict[str, Any], method: str, path: str) -> str:
+    raw = operation.get("operationId")
+    if isinstance(raw, str) and raw.strip():
+        return _slugify(raw)
+    composed = f"{method}_{path}"
+    return _slugify(composed)
+
+
+def _slugify(value: str) -> str:
+    cleaned = _NON_ALPHANUM.sub("_", value).strip("_")
+    if not cleaned:
+        cleaned = "tool"
+    # MCP tool names should start with a letter for parity with
+    # most validators that downstream clients run.
+    if not cleaned[0].isalpha():
+        cleaned = f"op_{cleaned}"
+    return cleaned.lower()
+
+
+def _disambiguate_name(tool: ToolDefinition, seen: set[str]) -> ToolDefinition:
+    if tool.name not in seen:
+        return tool
+    n = 2
+    while f"{tool.name}_{n}" in seen:
+        n += 1
+    new_name = f"{tool.name}_{n}"
+    return ToolDefinition(
+        name=new_name,
+        description=tool.description,
+        input_schema=tool.input_schema,
+        execution=tool.execution,
+        auth=tool.auth,
+        tags=tool.tags,
+        source_spec=tool.source_spec,
+    )
+
+
+def _tool_description(operation: dict[str, Any]) -> str:
+    summary = operation.get("summary") or ""
+    description = operation.get("description") or ""
+    if summary and description and summary.strip() != description.strip():
+        return f"{summary.strip()}\n\n{description.strip()}"
+    return (description or summary or "").strip() or "(no description)"
+
+
+# ---------------------------------------------------------------------------
+# Input schema synthesis
+# ---------------------------------------------------------------------------
+
+
+def _build_input_schema(
+    parameters: list[Any], request_body: dict[str, Any] | None
+) -> tuple[dict[str, Any], dict[str, str], bool]:
+    """Combine OpenAPI parameters + requestBody into one JSON Schema.
+
+    Returns (schema, parameter_locations, body_required).
+
+    ``parameter_locations`` maps each top-level property name to
+    where it goes in the HTTP request (``"path"`` / ``"query"`` /
+    ``"header"`` / ``"cookie"`` / ``"body"``).  The MCP tool
+    consumer doesn't need to know — but the executor does.
+    """
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    locations: dict[str, str] = {}
+
+    for raw_param in parameters:
+        if not isinstance(raw_param, dict):
+            continue
+        pname = raw_param.get("name")
+        loc = raw_param.get("in")
+        if not pname or not loc:
+            continue
+        schema = raw_param.get("schema") or {"type": "string"}
+        properties[pname] = _annotate_schema(schema, raw_param.get("description"))
+        locations[pname] = loc
+        if raw_param.get("required") or loc == "path":
+            required.append(pname)
+
+    body_required = False
+    if request_body and isinstance(request_body, dict):
+        body_required = bool(request_body.get("required"))
+        body_schema = _request_body_schema(request_body)
+        if body_schema is not None:
+            properties["body"] = body_schema
+            locations["body"] = "body"
+            if body_required:
+                required.append("body")
+
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = sorted(set(required))
+    schema["additionalProperties"] = False
+    return schema, locations, body_required
+
+
+def _annotate_schema(schema: dict[str, Any], description: str | None) -> dict[str, Any]:
+    if not description:
+        return schema
+    if "description" in schema:
+        return schema
+    return {**schema, "description": description}
+
+
+def _request_body_schema(request_body: dict[str, Any]) -> dict[str, Any] | None:
+    content = request_body.get("content") or {}
+    # Prefer JSON.  Fall back to the first content type we find.
+    if "application/json" in content:
+        media = content["application/json"]
+    elif content:
+        media = next(iter(content.values()))
+    else:
+        return None
+    schema = media.get("schema")
+    if not isinstance(schema, dict):
+        return None
+    desc = request_body.get("description")
+    return _annotate_schema(schema, desc)
+
+
+# ---------------------------------------------------------------------------
+# Servers / base URL
+# ---------------------------------------------------------------------------
+
+
+def _resolve_base_url(spec: dict[str, Any]) -> str:
+    """Pick the upstream base URL for tools in this spec.
+
+    Resolution order:
+        1. ``AI_ASSISTANT_SERVER_BASE_URL_OVERRIDE`` env (single
+           override for *all* tools — useful for routing through
+           a local proxy).
+        2. The first non-empty entry in ``servers[]``.
+        3. Swagger 2.0 ``host`` + ``basePath`` + ``schemes``.
+        4. Empty string — the executor will then require the host
+           to provide it via its own config.
+    """
+    override = os.environ.get("AI_ASSISTANT_SERVER_BASE_URL_OVERRIDE")
+    if override:
+        return override.rstrip("/")
+
+    servers = spec.get("servers")
+    if isinstance(servers, list):
+        for entry in servers:
+            if isinstance(entry, dict):
+                url = entry.get("url")
+                if isinstance(url, str) and url.strip():
+                    return url.rstrip("/")
+
+    # Swagger 2.0 fallback.
+    host = spec.get("host")
+    if isinstance(host, str) and host:
+        scheme = "https"
+        schemes = spec.get("schemes")
+        if isinstance(schemes, list) and schemes:
+            scheme = str(schemes[0])
+        base_path = str(spec.get("basePath") or "").rstrip("/")
+        return f"{scheme}://{host}{base_path}".rstrip("/")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+
+
+def _security_schemes(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    components = spec.get("components") or {}
+    schemes = components.get("securitySchemes") or {}
+    if isinstance(schemes, dict):
+        return schemes
+    # Swagger 2.0 puts these under top-level ``securityDefinitions``.
+    legacy = spec.get("securityDefinitions") or {}
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _resolve_auth(
+    security: list[Any] | None,
+    schemes: dict[str, dict[str, Any]],
+) -> AuthConfig:
+    """Pick the first OpenAPI security requirement we can execute.
+
+    ``security`` is a list of requirements where each entry maps
+    scheme name → list of scopes (we ignore scopes — those are
+    OAuth2-specific).  An empty list means "no auth."
+    """
+    if not security:
+        return AuthConfig()
+
+    for requirement in security:
+        if not isinstance(requirement, dict):
+            continue
+        # Each requirement entry can list multiple AND'ed schemes.
+        # We take the first one we know how to handle.
+        for scheme_name in requirement.keys():
+            scheme = schemes.get(scheme_name)
+            if not isinstance(scheme, dict):
+                continue
+            resolved = _scheme_to_auth_config(scheme_name, scheme)
+            if resolved.scheme is not AuthScheme.UNSUPPORTED:
+                return resolved
+    # No supported scheme matched — surface as unsupported so the
+    # executor can fail loudly instead of issuing an unauth'd call.
+    return AuthConfig(scheme=AuthScheme.UNSUPPORTED)
+
+
+def _scheme_to_auth_config(
+    scheme_name: str, scheme: dict[str, Any]
+) -> AuthConfig:
+    type_ = (scheme.get("type") or "").lower()
+    if type_ == "http":
+        sub = (scheme.get("scheme") or "").lower()
+        if sub == "bearer":
+            return AuthConfig(
+                scheme=AuthScheme.BEARER,
+                secret_env=_env_for(scheme_name),
+                scheme_name=scheme_name,
+            )
+        if sub == "basic":
+            return AuthConfig(
+                scheme=AuthScheme.BASIC,
+                secret_env=_env_for(scheme_name),
+                scheme_name=scheme_name,
+            )
+    if type_ == "apikey":
+        location = (scheme.get("in") or "").lower()
+        if location == "header":
+            return AuthConfig(
+                scheme=AuthScheme.API_KEY_HEADER,
+                secret_env=_env_for(scheme_name),
+                parameter_name=scheme.get("name"),
+                scheme_name=scheme_name,
+            )
+        if location == "query":
+            return AuthConfig(
+                scheme=AuthScheme.API_KEY_QUERY,
+                secret_env=_env_for(scheme_name),
+                parameter_name=scheme.get("name"),
+                scheme_name=scheme_name,
+            )
+    return AuthConfig(scheme=AuthScheme.UNSUPPORTED, scheme_name=scheme_name)
+
+
+def _env_for(scheme_name: str) -> str:
+    """Conventional env-var name for a security scheme.
+
+    ``bearerAuth`` → ``AI_ASSISTANT_SERVER_AUTH_BEARERAUTH``.
+    Hosts can override per scheme with this variable.
+    """
+    cleaned = re.sub(r"[^A-Z0-9]", "_", scheme_name.upper())
+    return f"AI_ASSISTANT_SERVER_AUTH_{cleaned}"

@@ -54,8 +54,8 @@ jobs:
         # `ai-assistant-server` install.
         run: pip-audit --skip-editable
 
-      - name: pytest
-        run: pytest -q
+      - name: pytest (with branch coverage gate ≥90%)
+        run: pytest -q --cov=ai_assistant_server --cov-branch --cov-report=term-missing --cov-fail-under=90
 
       - name: Validate sample tool specs
         # The repo ships YAML OpenAPI specs under tools/. Smoke-load

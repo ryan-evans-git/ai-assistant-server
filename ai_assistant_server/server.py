@@ -49,7 +49,11 @@ else:
     _IMPORT_ERROR = None
 
 from ai_assistant_server.executor import ToolExecutionError, execute_tool
-from ai_assistant_server.loader import load_tools_from_directory
+from ai_assistant_server.loader import (
+    load_plugins_from_directory,
+    load_plugins_from_module,
+    load_tools_from_directory,
+)
 from ai_assistant_server.models import ToolDefinition
 
 
@@ -106,6 +110,29 @@ def _tool_to_mcp(tool: ToolDefinition) -> "Tool":
     )
 
 
+def _enforce_unique_names(tools: list[ToolDefinition]) -> list[ToolDefinition]:
+    """Drop later tools that collide with an earlier one's name.
+
+    Names from OpenAPI specs are already disambiguated within each
+    spec; collisions here happen across sources (e.g. a plugin
+    function named the same as an OpenAPI operation).  We log and
+    drop the later registration rather than silently overwriting,
+    so the operator notices.
+    """
+    seen: set[str] = set()
+    out: list[ToolDefinition] = []
+    for t in tools:
+        if t.name in seen:
+            log.warning(
+                "Dropping duplicate tool name %r — first registration wins.",
+                t.name,
+            )
+            continue
+        seen.add(t.name)
+        out.append(t)
+    return out
+
+
 def _forwarded_credentials_from_env() -> dict[str, str]:
     """Read forwarded-credential headers passed via env at start.
 
@@ -141,12 +168,41 @@ def _format_payload(payload: Any) -> str:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ai-assistant-server",
-        description="MCP server backed by OpenAPI/Swagger tool specs.",
+        description=(
+            "MCP server backed by OpenAPI/Swagger specs and (optionally) "
+            "Python plugin functions registered via the @tool decorator."
+        ),
     )
     parser.add_argument(
         "--tools-dir",
         default=os.environ.get("AI_ASSISTANT_SERVER_TOOLS_DIR", "tools"),
         help="Directory containing OpenAPI spec files (default: ./tools).",
+    )
+    parser.add_argument(
+        "--plugin-module",
+        action="append",
+        default=[
+            m.strip()
+            for m in os.environ.get(
+                "AI_ASSISTANT_SERVER_PLUGIN_MODULES", ""
+            ).split(",")
+            if m.strip()
+        ],
+        help=(
+            "Dotted path to a Python module to import for @tool plugins.  "
+            "Repeatable.  Modules must be import-resolvable on the server's "
+            "PYTHONPATH.  Set AI_ASSISTANT_SERVER_PLUGIN_MODULES "
+            "(comma-separated) to provide defaults."
+        ),
+    )
+    parser.add_argument(
+        "--plugins-dir",
+        default=os.environ.get("AI_ASSISTANT_SERVER_PLUGINS_DIR", "plugins"),
+        help=(
+            "Directory containing freestanding *.py plugin files (default: "
+            "./plugins).  Each file is imported and any @tool-decorated "
+            "callables are registered.  Missing directory is silently OK."
+        ),
     )
     parser.add_argument(
         "--transport",
@@ -178,9 +234,34 @@ def main(argv: list[str] | None = None) -> int:
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    tools = load_tools_from_directory(Path(args.tools_dir))
+    tools: list[ToolDefinition] = []
+    # OpenAPI spec directory — same path as before.
+    if Path(args.tools_dir).is_dir():
+        tools.extend(load_tools_from_directory(Path(args.tools_dir)))
+    else:
+        log.info("No OpenAPI tools directory at %s — skipping", args.tools_dir)
+
+    # Plugin modules (explicit imports — primary path for packaged plugins).
+    for module_path in args.plugin_module or []:
+        try:
+            tools.extend(load_plugins_from_module(module_path))
+        except ImportError as err:
+            log.error("Failed to import plugin module %s: %s", module_path, err)
+            return 2
+
+    # Plugin directory (for quick iteration without packaging).
+    if Path(args.plugins_dir).is_dir():
+        tools.extend(load_plugins_from_directory(Path(args.plugins_dir)))
+
+    tools = _enforce_unique_names(tools)
     if not tools:
-        log.warning("No tools found under %s", args.tools_dir)
+        log.warning(
+            "No tools found.  Searched OpenAPI dir %s, plugin modules %s, "
+            "plugin dir %s.",
+            args.tools_dir,
+            args.plugin_module or "(none)",
+            args.plugins_dir,
+        )
     server = build_server(tools)
 
     if args.transport == "stdio":

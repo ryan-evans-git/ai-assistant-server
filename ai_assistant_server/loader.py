@@ -1,7 +1,7 @@
 """OpenAPI spec → tool definition loader.
 
 Walks a directory of .yaml / .yml / .json files, parses each as
-an OpenAPI document, and emits one :class:`ToolDefinition` per
+an OpenAPI document, and emits one :class:`OpenApiTool` per
 HTTP operation.
 
 Supports OpenAPI 3.0.x and 3.1.x.  Swagger 2.0 documents are
@@ -43,7 +43,8 @@ from ai_assistant_server.models import (
     AuthConfig,
     AuthScheme,
     HttpExecution,
-    ToolDefinition,
+    OpenApiTool,
+    PluginTool,
 )
 
 
@@ -54,7 +55,7 @@ SUPPORTED_EXTENSIONS = (".yaml", ".yml", ".json")
 HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 
-def load_tools_from_directory(directory: str | Path) -> list[ToolDefinition]:
+def load_tools_from_directory(directory: str | Path) -> list[OpenApiTool]:
     """Load every spec under ``directory`` and return all derived tools.
 
     Files with unsupported extensions are skipped silently.
@@ -65,7 +66,7 @@ def load_tools_from_directory(directory: str | Path) -> list[ToolDefinition]:
     if not root.is_dir():
         raise ValueError(f"tools directory does not exist: {root}")
 
-    tools: list[ToolDefinition] = []
+    tools: list[OpenApiTool] = []
     seen_names: set[str] = set()
 
     for spec_path in sorted(root.iterdir()):
@@ -106,7 +107,7 @@ def _read_spec(path: Path) -> dict[str, Any]:
 
 def _tools_from_spec(
     spec: dict[str, Any], *, source: str
-) -> Iterable[ToolDefinition]:
+) -> Iterable[OpenApiTool]:
     base_url = _resolve_base_url(spec)
     security_schemes = _security_schemes(spec)
     document_security = spec.get("security", []) or []
@@ -145,7 +146,7 @@ def _build_tool(
     security_schemes: dict[str, dict[str, Any]],
     document_security: list[Any],
     source: str,
-) -> ToolDefinition:
+) -> OpenApiTool:
     name = _tool_name(operation, method, path)
     description = _tool_description(operation)
     parameters = list(path_level_parameters) + list(
@@ -169,7 +170,7 @@ def _build_tool(
     tags_raw = operation.get("tags") or []
     tags: tuple[str, ...] = tuple(str(t) for t in tags_raw if isinstance(t, str))
 
-    return ToolDefinition(
+    return OpenApiTool(
         name=name,
         description=description,
         input_schema=input_schema,
@@ -207,14 +208,14 @@ def _slugify(value: str) -> str:
     return cleaned.lower()
 
 
-def _disambiguate_name(tool: ToolDefinition, seen: set[str]) -> ToolDefinition:
+def _disambiguate_name(tool: OpenApiTool, seen: set[str]) -> OpenApiTool:
     if tool.name not in seen:
         return tool
     n = 2
     while f"{tool.name}_{n}" in seen:
         n += 1
     new_name = f"{tool.name}_{n}"
-    return ToolDefinition(
+    return OpenApiTool(
         name=new_name,
         description=tool.description,
         input_schema=tool.input_schema,
@@ -439,3 +440,82 @@ def _env_for(scheme_name: str) -> str:
     """
     cleaned = re.sub(r"[^A-Z0-9]", "_", scheme_name.upper())
     return f"AI_ASSISTANT_SERVER_AUTH_{cleaned}"
+
+
+# ---------------------------------------------------------------------------
+# Python plugin loading
+# ---------------------------------------------------------------------------
+
+
+def load_plugins_from_module(module_path: str) -> list[PluginTool]:
+    """Import ``module_path`` (dotted form, e.g. ``my_pkg.tools``) and
+    return every :class:`PluginTool` registered in it via the ``@tool``
+    decorator.
+
+    Raises :class:`ImportError` propagated from ``importlib`` when the
+    target module can't be imported — the server's startup logs that
+    and exits with a clear error rather than silently skipping.
+    """
+    import importlib
+
+    from ai_assistant_server.plugins import get_plugin_tool
+
+    module = importlib.import_module(module_path)
+    plugins: list[PluginTool] = []
+    for attr_name in dir(module):
+        obj = getattr(module, attr_name)
+        plugin = get_plugin_tool(obj)
+        if plugin is not None:
+            plugins.append(plugin)
+    log.info(
+        "Loaded %d plugin tool(s) from module %s", len(plugins), module_path
+    )
+    return plugins
+
+
+def load_plugins_from_directory(directory: str | Path) -> list[PluginTool]:
+    """Import every ``*.py`` file under ``directory`` and return all
+    decorated :class:`PluginTool` instances found across them.
+
+    Files starting with ``_`` are skipped (so ``__init__.py`` and
+    ``_helpers.py`` style modules don't pull in side-effect imports
+    twice).  Each file is loaded as a freestanding module — the
+    directory does *not* need an ``__init__.py``.  Tests that need
+    importable plugin modules should still use
+    :func:`load_plugins_from_module`.
+    """
+    import importlib.util
+    import sys
+
+    from ai_assistant_server.plugins import get_plugin_tool
+
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+
+    plugins: list[PluginTool] = []
+    for path in sorted(root.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        # Use a synthetic module name namespaced under the directory
+        # so multiple plugin dirs don't collide in sys.modules.
+        mod_name = f"_aai_plugin_{root.name}_{path.stem}"
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            log.warning("Could not load plugin file %s", path)
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as err:  # noqa: BLE001
+            log.warning("Skipping plugin file %s: %s", path.name, err)
+            del sys.modules[mod_name]
+            continue
+        for attr_name in dir(module):
+            obj = getattr(module, attr_name)
+            plugin = get_plugin_tool(obj)
+            if plugin is not None:
+                plugins.append(plugin)
+    log.info("Loaded %d plugin tool(s) from %s", len(plugins), root)
+    return plugins

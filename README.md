@@ -4,19 +4,24 @@ A spec-driven [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
 server. Drop OpenAPI 3.x / Swagger 2.0 spec files into `tools/` and every
 operation becomes an MCP tool — names, descriptions, JSON-Schema inputs,
 base URLs, and auth requirements are all derived from the spec.
+**Or** drop a Python file into `plugins/` with `@tool`-decorated functions
+and the server registers those alongside the spec-derived tools.
 
 Built for **multi-tenant** deployments: credentials can be supplied
 per-request and forwarded to the upstream API on the caller's behalf,
 keyed by the spec's `securitySchemes`. No shared service-account leaks
 between tenants. Speaks both stdio and SSE MCP transports.
 
-No code changes to add a new tool. Just drop in the spec.
+No code changes to add a new HTTP tool. Just drop in the spec.
 
 ```
 tools/
   petstore.yaml          ← https://petstore3.swagger.io/api/v3
   github.yaml            ← bearer-auth, env-mapped
   internal-api.yaml      ← your private API
+
+plugins/
+  sample.py              ← @tool-decorated Python functions
 ```
 
 ## Why
@@ -33,6 +38,53 @@ thin adapter that knows how to:
    from environment variables or per-request forwarded credentials.
 
 Add an API by writing — or downloading — its OpenAPI spec.
+
+## Adding a Python plugin (non-API tools)
+
+Some tools don't have an API behind them — local file access, math,
+date computations, an in-process database query, an inference call,
+etc. For these, use the `@tool` decorator:
+
+```python
+# plugins/my_tools.py
+from typing import Literal
+from ai_assistant_server import tool
+
+
+@tool(
+    name="convert_temperature",
+    description="Convert between Celsius, Fahrenheit, and Kelvin.",
+    tags=("math", "units"),
+)
+def convert_temperature(
+    value: float,
+    from_unit: Literal["c", "f", "k"],
+    to_unit: Literal["c", "f", "k"],
+) -> dict:
+    ...
+```
+
+The JSON Schema MCP needs is **derived from the function's signature**
+via Pydantic — every annotation Pydantic understands is supported
+(`str` / `int` / `float` / `bool` / `Literal[...]` / `Optional[T]` /
+`list[T]` / `dict[K, V]` / `Enum` / Pydantic `BaseModel` subclasses).
+Defaults become the schema's `default`; parameters without a default
+land in `required`.
+
+Two ways to register your plugins:
+
+| Source | When to use |
+|---|---|
+| `plugins/*.py` directory (default `./plugins`) | Quick iteration, no packaging required. Each `*.py` file is loaded as a freestanding module; `_*.py` is skipped. |
+| `--plugin-module pkg.module` (repeatable) | When your plugins are an installed Python package. Module must be import-resolvable on the server's `PYTHONPATH`. |
+
+Set `AI_ASSISTANT_SERVER_PLUGINS_DIR` or `AI_ASSISTANT_SERVER_PLUGIN_MODULES`
+(comma-separated list) to drive these from the environment instead of CLI
+flags.
+
+Async handlers (`async def`) are supported — they're awaited; sync
+handlers run inline. Handler exceptions are wrapped and returned to
+the agent as a tool error, so the assistant can react and retry.
 
 ## Install
 

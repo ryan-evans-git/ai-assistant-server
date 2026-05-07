@@ -1,4 +1,4 @@
-"""Executor tests — given a ToolDefinition + args, dispatch the HTTP call."""
+"""Executor tests — given a OpenApiTool + args, dispatch the HTTP call."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ai_assistant_server.models import (
     AuthConfig,
     AuthScheme,
     HttpExecution,
-    ToolDefinition,
+    OpenApiTool,
 )
 from ai_assistant_server.auth import AppliedAuth
 
@@ -27,8 +27,8 @@ def _tool(
     base_url: str = "https://api.example.com",
     auth: AuthConfig | None = None,
     request_body_required: bool = False,
-) -> ToolDefinition:
-    return ToolDefinition(
+) -> OpenApiTool:
+    return OpenApiTool(
         name="get_thing",
         description="Get a thing.",
         input_schema={"type": "object", "properties": {}},
@@ -164,6 +164,56 @@ async def test_execute_tool_happy_path() -> None:
     assert result.body == {"ok": True}
     assert captured["url"] == "https://api.example.com/things/7"
     assert captured["method"] == "GET"
+
+
+@pytest.mark.asyncio
+async def test_post_without_body_sends_empty_object() -> None:
+    """Specs that declare POST/PUT/PATCH/DELETE without a requestBody
+    used to send no body and no Content-Type header — some upstreams
+    reject that as a protocol error.  We default to {} so httpx
+    attaches Content-Type: application/json + a non-zero
+    Content-Length."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["content_type"] = request.headers.get("content-type")
+        captured["content_length"] = request.headers.get("content-length")
+        captured["body"] = request.content
+        return httpx.Response(200, json={"ok": True})
+
+    tool = _tool(method="post", path="/things", locations={})
+    async with httpx.AsyncClient(transport=_mock_transport(handler)) as client:
+        result = await execute_tool(tool, {}, client=client)
+
+    assert result.status_code == 200
+    assert captured["method"] == "POST"
+    assert captured["content_type"] == "application/json"
+    # `{}` serializes to 2 bytes — Content-Length must reflect that,
+    # not be missing.
+    assert captured["content_length"] == "2"
+    assert captured["body"] == b"{}"
+
+
+@pytest.mark.asyncio
+async def test_get_without_body_does_not_inject_empty_object() -> None:
+    """The empty-body fallback applies only to body-bearing methods.
+    GET/HEAD/OPTIONS must remain bodyless or a few servers will 400."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["content_type"] = request.headers.get("content-type")
+        captured["body"] = request.content
+        return httpx.Response(200, json={"ok": True})
+
+    tool = _tool(method="get", path="/things", locations={})
+    async with httpx.AsyncClient(transport=_mock_transport(handler)) as client:
+        await execute_tool(tool, {}, client=client)
+
+    assert captured["method"] == "GET"
+    assert captured["content_type"] is None
+    assert captured["body"] == b""
 
 
 @pytest.mark.asyncio

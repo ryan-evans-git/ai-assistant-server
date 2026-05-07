@@ -7,7 +7,6 @@ natural test — the redundancy is easy to spot and prune.
 
 from __future__ import annotations
 
-import inspect
 import logging
 import textwrap
 from pathlib import Path
@@ -16,7 +15,6 @@ from typing import Any
 import httpx
 import pytest
 
-from ai_assistant_server import tool
 from ai_assistant_server.auth import AuthResolutionError, resolve_auth
 from ai_assistant_server.executor import (
     ToolExecutionError,

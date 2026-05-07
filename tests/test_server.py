@@ -11,7 +11,6 @@ SDK's stream contracts in significant detail.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,6 @@ from unittest.mock import patch
 import pytest
 
 from ai_assistant_server import tool
-from ai_assistant_server.executor import ToolExecutionError
 from ai_assistant_server.models import (
     AuthConfig,
     HttpExecution,

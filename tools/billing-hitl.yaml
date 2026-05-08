@@ -1,0 +1,51 @@
+openapi: 3.0.3
+info:
+  title: Billing (HITL example)
+  version: 1.0.0
+  description: |
+    Tiny example spec demonstrating the ``x-aai-*`` vendor extensions
+    that mark an OpenAPI operation as requiring user confirmation
+    before the agent dispatches it.
+
+    Drop this file in the server's tools/ directory.  The
+    ``createCharge`` operation will show a confirmation modal in the
+    UI before any HTTP request is made.
+
+servers:
+  - url: https://api.example.invalid/v1
+
+paths:
+  /charges:
+    post:
+      operationId: createCharge
+      summary: Charge a customer's card
+      description: >
+        Authorize and capture a charge against the supplied card.
+        Always pauses for human confirmation — money in motion.
+      # ── HITL extensions ─────────────────────────────────────────
+      x-aai-requires-confirmation: true
+      x-aai-confirm-timeout-seconds: 45
+      x-aai-confirm-message: "Charge customer card?"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customer_id, amount_cents, currency]
+              properties:
+                customer_id:
+                  type: string
+                amount_cents:
+                  type: integer
+                  minimum: 1
+                currency:
+                  type: string
+                  enum: [USD, EUR, GBP]
+                description:
+                  type: string
+      responses:
+        "200":
+          description: Charge captured.
+        "402":
+          description: Card declined.

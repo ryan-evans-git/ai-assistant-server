@@ -77,6 +77,32 @@ class HttpExecution:
 
 
 # ---------------------------------------------------------------------------
+# Human-in-the-loop config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HitlConfig:
+    """Per-tool human-in-the-loop policy.
+
+    Default-off: a tool that doesn't set any of these fields runs
+    exactly as before — no confirmation, no pause.  When
+    ``requires_confirmation`` is ``True`` the metadata travels to
+    the client (via MCP ``Tool.annotations``) and the agent loop
+    pauses before dispatch to surface a confirm/decline modal.
+
+    ``confirm_message`` is an optional one-line UI hint shown above
+    the JSON-formatted tool input.  ``timeout_seconds`` lets the
+    tool author override the client-side default timeout (e.g. a
+    long-running review can ask for 5 minutes).
+    """
+
+    requires_confirmation: bool = False
+    timeout_seconds: int | None = None
+    confirm_message: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
 
@@ -99,6 +125,7 @@ class OpenApiTool:
     # for progressive discovery on the client side.
     tags: tuple[str, ...] = field(default_factory=tuple)
     source_spec: str = ""
+    hitl: HitlConfig = field(default_factory=HitlConfig)
 
 
 # A plugin handler is an async- or sync-callable that takes the
@@ -119,6 +146,7 @@ class PluginTool:
     handler: PluginHandler
     tags: tuple[str, ...] = field(default_factory=tuple)
     source_module: str = ""
+    hitl: HitlConfig = field(default_factory=HitlConfig)
 
 
 # Public alias so callers don't have to spell out the union every

@@ -42,6 +42,7 @@ import yaml
 from ai_assistant_server.models import (
     AuthConfig,
     AuthScheme,
+    HitlConfig,
     HttpExecution,
     OpenApiTool,
     PluginTool,
@@ -169,6 +170,7 @@ def _build_tool(
     )
     tags_raw = operation.get("tags") or []
     tags: tuple[str, ...] = tuple(str(t) for t in tags_raw if isinstance(t, str))
+    hitl = _hitl_from_operation(operation)
 
     return OpenApiTool(
         name=name,
@@ -178,6 +180,52 @@ def _build_tool(
         auth=auth,
         tags=tags,
         source_spec=source,
+        hitl=hitl,
+    )
+
+
+def _hitl_from_operation(operation: dict[str, Any]) -> HitlConfig:
+    """Read ``x-aai-*`` HITL vendor extensions off an OpenAPI op.
+
+    Two surface forms supported:
+
+    * Flat: ``x-aai-requires-confirmation: true`` /
+      ``x-aai-confirm-timeout-seconds: 30`` /
+      ``x-aai-confirm-message: "Send email?"``
+    * Nested: ``x-aai-hitl: {requires_confirmation: true, ...}`` for
+      authors who prefer to group the keys.
+
+    Unrecognized values fall back to defaults; we never raise from
+    a malformed extension — the OpenAPI spec is otherwise valid.
+    """
+    nested = operation.get("x-aai-hitl") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+
+    def _flag(flat_key: str, nested_key: str, default: Any) -> Any:
+        if flat_key in operation:
+            return operation[flat_key]
+        if nested_key in nested:
+            return nested[nested_key]
+        return default
+
+    requires = bool(
+        _flag("x-aai-requires-confirmation", "requires_confirmation", False)
+    )
+    timeout = _flag("x-aai-confirm-timeout-seconds", "timeout_seconds", None)
+    message = _flag("x-aai-confirm-message", "confirm_message", None)
+
+    timeout_int: int | None
+    try:
+        timeout_int = int(timeout) if timeout is not None else None
+    except (TypeError, ValueError):
+        timeout_int = None
+    message_str = str(message) if message is not None else None
+
+    return HitlConfig(
+        requires_confirmation=requires,
+        timeout_seconds=timeout_int,
+        confirm_message=message_str,
     )
 
 

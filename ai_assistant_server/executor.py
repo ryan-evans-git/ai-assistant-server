@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -31,6 +31,26 @@ from ai_assistant_server.models import (
     PluginTool,
     ToolDefinition,
 )
+
+
+# Status codes that suggest the on-disk OpenAPI spec is out of date
+# relative to the live API — i.e. the upstream no longer knows about
+# the operation at the path/method we declared.  Other 4xx/5xx codes
+# are *not* drift-shaped: 400 is usually a bad argument, 401/403 is
+# auth, 429 is rate limiting, 5xx is the upstream having a bad day.
+# Refreshing the spec wouldn't help in any of those cases.
+DRIFT_STATUS_CODES = frozenset({404, 410})
+
+
+# Callback the host wires in so the executor can ask for a spec
+# refresh after a drift-shaped failure.  Returns a *new* tool to
+# retry with, or ``None`` if no usable refresh was available (spec
+# unchanged, cooldown active, fetch failed, etc.).  See
+# :class:`ai_assistant_server.refresher.SpecRefresher` for the
+# server-side implementation.
+RefreshCallback = Callable[
+    [OpenApiTool, "ToolExecutionError"], Awaitable["OpenApiTool | None"]
+]
 
 
 class ToolExecutionError(RuntimeError):
@@ -55,17 +75,28 @@ async def execute_tool(
     *,
     client: httpx.AsyncClient | None = None,
     forwarded_credentials: dict[str, str] | None = None,
+    refresh: RefreshCallback | None = None,
 ) -> ToolResult:
     """Run a tool call.
 
     For OpenAPI tools, ``client`` (an ``httpx.AsyncClient``) shares a
     connection pool across calls; one is created per-call when not
     provided.  Plugin tools ignore the HTTP-only kwargs.
+
+    ``refresh`` is an optional callback the executor consults after
+    a drift-shaped failure (currently HTTP 404 or 410) — see
+    :data:`DRIFT_STATUS_CODES`.  When it returns a tool object
+    distinct from the one we just tried, the executor retries once
+    against that tool.
     """
     if isinstance(tool, PluginTool):
         return await _execute_plugin(tool, arguments or {})
     return await _execute_openapi(
-        tool, arguments or {}, client=client, forwarded_credentials=forwarded_credentials
+        tool,
+        arguments or {},
+        client=client,
+        forwarded_credentials=forwarded_credentials,
+        refresh=refresh,
     )
 
 
@@ -107,6 +138,41 @@ async def _execute_plugin(
 
 
 async def _execute_openapi(
+    tool: OpenApiTool,
+    arguments: dict[str, Any],
+    *,
+    client: httpx.AsyncClient | None,
+    forwarded_credentials: dict[str, str] | None,
+    refresh: RefreshCallback | None = None,
+) -> ToolResult:
+    current = tool
+    while True:
+        try:
+            return await _execute_openapi_once(
+                current,
+                arguments,
+                client=client,
+                forwarded_credentials=forwarded_credentials,
+            )
+        except ToolExecutionError as err:
+            if (
+                refresh is None
+                or current.spec_url is None
+                or err.status_code not in DRIFT_STATUS_CODES
+            ):
+                raise
+            refreshed = await refresh(current, err)
+            if refreshed is None or refreshed is current:
+                raise
+            # Refresh produced a tool with a materially different
+            # execution shape — retry exactly once against that
+            # tool.  Clear ``refresh`` so a second drift-shaped
+            # failure surfaces instead of looping.
+            current = refreshed
+            refresh = None
+
+
+async def _execute_openapi_once(
     tool: OpenApiTool,
     arguments: dict[str, Any],
     *,

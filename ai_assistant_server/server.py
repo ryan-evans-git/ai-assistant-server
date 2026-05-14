@@ -55,6 +55,7 @@ from ai_assistant_server.loader import (
     load_tools_from_directory,
 )
 from ai_assistant_server.models import ToolDefinition
+from ai_assistant_server.refresher import SpecRefresher
 
 
 log = logging.getLogger(__name__)
@@ -70,9 +71,13 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
         )
 
     server = Server("ai-assistant-server")
-    catalog = {t.name: t for t in tools}
+    catalog: dict[str, ToolDefinition] = {t.name: t for t in tools}
     # Share one connection pool across the server lifetime.
     client = httpx.AsyncClient(timeout=30.0)
+    # The refresher patches ``catalog`` in place when a drift-shaped
+    # failure (see executor.DRIFT_STATUS_CODES) is followed by a
+    # successful re-fetch of the tool's ``x-aai-spec-url``.
+    refresher = SpecRefresher(catalog, client=client)
 
     @server.list_tools()
     async def list_tools() -> list["Tool"]:
@@ -86,7 +91,11 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
         forwarded = _forwarded_credentials_from_env()
         try:
             result = await execute_tool(
-                tool, arguments, client=client, forwarded_credentials=forwarded
+                tool,
+                arguments,
+                client=client,
+                forwarded_credentials=forwarded,
+                refresh=refresher.refresh,
             )
         except ToolExecutionError as err:
             payload = {
@@ -99,15 +108,38 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
 
     server._catalog = catalog  # type: ignore[attr-defined]
     server._client = client  # type: ignore[attr-defined]
+    server._refresher = refresher  # type: ignore[attr-defined]
     return server
 
 
 def _tool_to_mcp(tool: ToolDefinition) -> "Tool":
-    return Tool(
-        name=tool.name,
-        description=tool.description,
-        inputSchema=tool.input_schema,
-    )
+    kwargs: dict[str, Any] = {
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    }
+    annotations = _hitl_annotations(tool)
+    if annotations is not None:
+        # MCP `Tool.annotations` is the SDK-blessed channel for tool-
+        # level metadata that isn't part of the input schema.  We
+        # nest under a vendor-prefixed ``aai`` key to avoid colliding
+        # with any future MCP-spec-reserved annotation names.
+        kwargs["annotations"] = annotations
+    return Tool(**kwargs)
+
+
+def _hitl_annotations(tool: ToolDefinition) -> dict[str, Any] | None:
+    """Return the ``annotations`` payload for a tool, or ``None`` when
+    the tool has no HITL config (so plain tools stay un-annotated)."""
+    hitl = getattr(tool, "hitl", None)
+    if hitl is None or not hitl.requires_confirmation:
+        return None
+    payload: dict[str, Any] = {"requires_confirmation": True}
+    if hitl.timeout_seconds is not None:
+        payload["timeout_seconds"] = hitl.timeout_seconds
+    if hitl.confirm_message:
+        payload["message"] = hitl.confirm_message
+    return {"aai": payload}
 
 
 def _enforce_unique_names(tools: list[ToolDefinition]) -> list[ToolDefinition]:

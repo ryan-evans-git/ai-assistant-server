@@ -86,6 +86,69 @@ Async handlers (`async def`) are supported — they're awaited; sync
 handlers run inline. Handler exceptions are wrapped and returned to
 the agent as a tool error, so the assistant can react and retry.
 
+## Human-in-the-loop tools
+
+Mark a tool as needing the user's approval before it runs. The
+agent loop on the client side pauses, fires a confirmation modal in
+the chat UI, and only dispatches the tool once the user clicks
+**Confirm** (or aborts on **Decline** / timeout).
+
+For Python plugins, three new kwargs on `@tool(...)`:
+
+```python
+@tool(
+    name="send_email",
+    description="Send an email on the user's behalf.",
+    requires_confirmation=True,
+    confirm_message="Send this email?",         # optional one-line UI hint
+    confirm_timeout_seconds=60,                 # optional override
+)
+def send_email(*, to: str, subject: str, body: str) -> dict:
+    ...
+```
+
+For OpenAPI specs, three vendor extensions on the operation (or a
+nested `x-aai-hitl: { ... }` block):
+
+```yaml
+paths:
+  /charges:
+    post:
+      operationId: createCharge
+      x-aai-requires-confirmation: true
+      x-aai-confirm-timeout-seconds: 45
+      x-aai-confirm-message: "Charge customer card?"
+```
+
+The flag rides through MCP via `Tool.annotations.aai` and is
+honored by any HITL-aware client. See `plugins/sample_hitl.py` and
+`tools/billing-hitl.yaml` for runnable examples.
+
+## Self-healing on spec drift
+
+The on-disk OpenAPI file is the pinned source of truth, but a running
+API can move out from under it (renamed paths, dropped operations).
+Add an `x-aai-spec-url` extension pointing at the live spec — at the
+document root or under `info` — and the server will re-fetch it
+**only** when an upstream call fails in a way that suggests drift
+(HTTP 404 or 410 on a known operation), then retry the call once
+against the refreshed shape.
+
+```yaml
+openapi: 3.0.3
+x-aai-spec-url: https://api.example.com/openapi.json
+info:
+  title: Sample
+  version: 1.0.0
+```
+
+Conservative on purpose: 5xx / timeouts / auth / rate-limit errors
+do not trigger a refresh; a fetch that returns a byte-equivalent
+spec is treated as "no change" and skips the retry; per-URL
+cooldown caps refresh attempts to one per minute. The pinned file
+is never written to from runtime — reconciling drift back into the
+repo is a separate, deliberate step.
+
 ## Install
 
 ```bash

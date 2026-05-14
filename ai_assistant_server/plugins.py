@@ -34,7 +34,7 @@ from typing import Any, get_type_hints
 
 from pydantic import Field, create_model
 
-from ai_assistant_server.models import PluginTool
+from ai_assistant_server.models import HitlConfig, PluginTool
 
 
 # Attribute marker the decorator stamps onto the wrapped function.
@@ -47,6 +47,9 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     tags: tuple[str, ...] | list[str] = (),
+    requires_confirmation: bool = False,
+    confirm_timeout_seconds: int | None = None,
+    confirm_message: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorate a Python callable so the server registers it as a tool.
 
@@ -61,6 +64,20 @@ def tool(
     tags:
         Optional tags for progressive-discovery ranking on the
         client side.
+    requires_confirmation:
+        If ``True``, the agent will pause before dispatching this
+        tool and surface a confirm/decline modal in the UI.  Use for
+        destructive ops, sends, or anything else a human should
+        approve.  Default ``False`` keeps the existing immediate-
+        dispatch behavior.
+    confirm_timeout_seconds:
+        Override the client-side default confirmation timeout for
+        this tool (e.g. ``120`` for a long review).  ``None`` means
+        "use the client default."
+    confirm_message:
+        Optional one-line UI hint shown above the JSON-formatted
+        tool input on the modal.  Keep short — the modal already
+        shows the tool name, description, and arguments.
     """
 
     def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -74,6 +91,11 @@ def tool(
             )
 
         input_schema = derive_input_schema(fn)
+        hitl = HitlConfig(
+            requires_confirmation=requires_confirmation,
+            timeout_seconds=confirm_timeout_seconds,
+            confirm_message=confirm_message,
+        )
         plugin = PluginTool(
             name=tool_name,
             description=tool_desc,
@@ -81,6 +103,7 @@ def tool(
             handler=fn,
             tags=tuple(tags),
             source_module=fn.__module__,
+            hitl=hitl,
         )
         # Attach the resolved PluginTool to the function so the plugin
         # loader can find it without re-introspecting.  The function

@@ -55,6 +55,7 @@ from ai_assistant_server.loader import (
     load_tools_from_directory,
 )
 from ai_assistant_server.models import ToolDefinition
+from ai_assistant_server.refresher import SpecRefresher
 
 
 log = logging.getLogger(__name__)
@@ -70,9 +71,13 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
         )
 
     server = Server("ai-assistant-server")
-    catalog = {t.name: t for t in tools}
+    catalog: dict[str, ToolDefinition] = {t.name: t for t in tools}
     # Share one connection pool across the server lifetime.
     client = httpx.AsyncClient(timeout=30.0)
+    # The refresher patches ``catalog`` in place when a drift-shaped
+    # failure (see executor.DRIFT_STATUS_CODES) is followed by a
+    # successful re-fetch of the tool's ``x-aai-spec-url``.
+    refresher = SpecRefresher(catalog, client=client)
 
     @server.list_tools()
     async def list_tools() -> list["Tool"]:
@@ -86,7 +91,11 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
         forwarded = _forwarded_credentials_from_env()
         try:
             result = await execute_tool(
-                tool, arguments, client=client, forwarded_credentials=forwarded
+                tool,
+                arguments,
+                client=client,
+                forwarded_credentials=forwarded,
+                refresh=refresher.refresh,
             )
         except ToolExecutionError as err:
             payload = {
@@ -99,6 +108,7 @@ def build_server(tools: list[ToolDefinition]) -> "Server":
 
     server._catalog = catalog  # type: ignore[attr-defined]
     server._client = client  # type: ignore[attr-defined]
+    server._refresher = refresher  # type: ignore[attr-defined]
     return server
 
 

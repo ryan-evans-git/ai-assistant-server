@@ -126,6 +126,11 @@ class OpenApiTool:
     tags: tuple[str, ...] = field(default_factory=tuple)
     source_spec: str = ""
     hitl: HitlConfig = field(default_factory=HitlConfig)
+    # Optional pointer back to a live OpenAPI document the server can
+    # re-fetch when an upstream call fails in a way that suggests the
+    # on-disk spec is stale (see :mod:`ai_assistant_server.refresher`).
+    # Sourced from the ``x-aai-spec-url`` extension on the spec doc.
+    spec_url: str | None = None
 
 
 # A plugin handler is an async- or sync-callable that takes the

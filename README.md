@@ -4,19 +4,24 @@ A spec-driven [Model Context Protocol](https://modelcontextprotocol.io) (MCP)
 server. Drop OpenAPI 3.x / Swagger 2.0 spec files into `tools/` and every
 operation becomes an MCP tool — names, descriptions, JSON-Schema inputs,
 base URLs, and auth requirements are all derived from the spec.
+**Or** drop a Python file into `plugins/` with `@tool`-decorated functions
+and the server registers those alongside the spec-derived tools.
 
 Built for **multi-tenant** deployments: credentials can be supplied
 per-request and forwarded to the upstream API on the caller's behalf,
 keyed by the spec's `securitySchemes`. No shared service-account leaks
 between tenants. Speaks both stdio and SSE MCP transports.
 
-No code changes to add a new tool. Just drop in the spec.
+No code changes to add a new HTTP tool. Just drop in the spec.
 
 ```
 tools/
   petstore.yaml          ← https://petstore3.swagger.io/api/v3
   github.yaml            ← bearer-auth, env-mapped
   internal-api.yaml      ← your private API
+
+plugins/
+  sample.py              ← @tool-decorated Python functions
 ```
 
 ## Why
@@ -33,6 +38,116 @@ thin adapter that knows how to:
    from environment variables or per-request forwarded credentials.
 
 Add an API by writing — or downloading — its OpenAPI spec.
+
+## Adding a Python plugin (non-API tools)
+
+Some tools don't have an API behind them — local file access, math,
+date computations, an in-process database query, an inference call,
+etc. For these, use the `@tool` decorator:
+
+```python
+# plugins/my_tools.py
+from typing import Literal
+from ai_assistant_server import tool
+
+
+@tool(
+    name="convert_temperature",
+    description="Convert between Celsius, Fahrenheit, and Kelvin.",
+    tags=("math", "units"),
+)
+def convert_temperature(
+    value: float,
+    from_unit: Literal["c", "f", "k"],
+    to_unit: Literal["c", "f", "k"],
+) -> dict:
+    ...
+```
+
+The JSON Schema MCP needs is **derived from the function's signature**
+via Pydantic — every annotation Pydantic understands is supported
+(`str` / `int` / `float` / `bool` / `Literal[...]` / `Optional[T]` /
+`list[T]` / `dict[K, V]` / `Enum` / Pydantic `BaseModel` subclasses).
+Defaults become the schema's `default`; parameters without a default
+land in `required`.
+
+Two ways to register your plugins:
+
+| Source | When to use |
+|---|---|
+| `plugins/*.py` directory (default `./plugins`) | Quick iteration, no packaging required. Each `*.py` file is loaded as a freestanding module; `_*.py` is skipped. |
+| `--plugin-module pkg.module` (repeatable) | When your plugins are an installed Python package. Module must be import-resolvable on the server's `PYTHONPATH`. |
+
+Set `AI_ASSISTANT_SERVER_PLUGINS_DIR` or `AI_ASSISTANT_SERVER_PLUGIN_MODULES`
+(comma-separated list) to drive these from the environment instead of CLI
+flags.
+
+Async handlers (`async def`) are supported — they're awaited; sync
+handlers run inline. Handler exceptions are wrapped and returned to
+the agent as a tool error, so the assistant can react and retry.
+
+## Human-in-the-loop tools
+
+Mark a tool as needing the user's approval before it runs. The
+agent loop on the client side pauses, fires a confirmation modal in
+the chat UI, and only dispatches the tool once the user clicks
+**Confirm** (or aborts on **Decline** / timeout).
+
+For Python plugins, three new kwargs on `@tool(...)`:
+
+```python
+@tool(
+    name="send_email",
+    description="Send an email on the user's behalf.",
+    requires_confirmation=True,
+    confirm_message="Send this email?",         # optional one-line UI hint
+    confirm_timeout_seconds=60,                 # optional override
+)
+def send_email(*, to: str, subject: str, body: str) -> dict:
+    ...
+```
+
+For OpenAPI specs, three vendor extensions on the operation (or a
+nested `x-aai-hitl: { ... }` block):
+
+```yaml
+paths:
+  /charges:
+    post:
+      operationId: createCharge
+      x-aai-requires-confirmation: true
+      x-aai-confirm-timeout-seconds: 45
+      x-aai-confirm-message: "Charge customer card?"
+```
+
+The flag rides through MCP via `Tool.annotations.aai` and is
+honored by any HITL-aware client. See `plugins/sample_hitl.py` and
+`tools/billing-hitl.yaml` for runnable examples.
+
+## Self-healing on spec drift
+
+The on-disk OpenAPI file is the pinned source of truth, but a running
+API can move out from under it (renamed paths, dropped operations).
+Add an `x-aai-spec-url` extension pointing at the live spec — at the
+document root or under `info` — and the server will re-fetch it
+**only** when an upstream call fails in a way that suggests drift
+(HTTP 404 or 410 on a known operation), then retry the call once
+against the refreshed shape.
+
+```yaml
+openapi: 3.0.3
+x-aai-spec-url: https://api.example.com/openapi.json
+info:
+  title: Sample
+  version: 1.0.0
+```
+
+Conservative on purpose: 5xx / timeouts / auth / rate-limit errors
+do not trigger a refresh; a fetch that returns a byte-equivalent
+spec is treated as "no change" and skips the retry; per-URL
+cooldown caps refresh attempts to one per minute. The pinned file
+is never written to from runtime — reconciling drift back into the
+repo is a separate, deliberate step.
 
 ## Install
 

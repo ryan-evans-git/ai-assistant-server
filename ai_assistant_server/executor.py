@@ -1,27 +1,56 @@
-"""HTTP executor for tool calls derived from OpenAPI specs.
+"""Executor for tool calls — dispatches by tool kind.
 
-Given a :class:`ToolDefinition` and a JSON arguments dict, build
-the upstream HTTP request: substitute path templates, attach
-query / header / cookie parameters, JSON-encode the body, and
-apply the resolved auth.  Returns the upstream response body
-(JSON-decoded when possible) plus status code.
+For an :class:`OpenApiTool`, this builds the upstream HTTP request
+(path templates, query / header / cookie parameters, JSON body, and
+resolved auth) and returns the upstream response body.
+
+For a :class:`PluginTool`, this calls the registered Python handler
+with the parsed argument dict, awaits it if it's a coroutine, and
+wraps the return value in a :class:`ToolResult`.
 
 Error semantics:
     * Network errors → :class:`ToolExecutionError`.
     * 4xx / 5xx responses → :class:`ToolExecutionError` with the
       status code in the message + body included so the agent
       can recover (e.g. "argument was missing — retry").
+    * Plugin handler exceptions are wrapped in a
+      :class:`ToolExecutionError` with ``status_code=None``.
 """
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
 from ai_assistant_server.auth import AppliedAuth, resolve_auth
-from ai_assistant_server.models import ToolDefinition
+from ai_assistant_server.models import (
+    OpenApiTool,
+    PluginTool,
+    ToolDefinition,
+)
+
+
+# Status codes that suggest the on-disk OpenAPI spec is out of date
+# relative to the live API — i.e. the upstream no longer knows about
+# the operation at the path/method we declared.  Other 4xx/5xx codes
+# are *not* drift-shaped: 400 is usually a bad argument, 401/403 is
+# auth, 429 is rate limiting, 5xx is the upstream having a bad day.
+# Refreshing the spec wouldn't help in any of those cases.
+DRIFT_STATUS_CODES = frozenset({404, 410})
+
+
+# Callback the host wires in so the executor can ask for a spec
+# refresh after a drift-shaped failure.  Returns a *new* tool to
+# retry with, or ``None`` if no usable refresh was available (spec
+# unchanged, cooldown active, fetch failed, etc.).  See
+# :class:`ai_assistant_server.refresher.SpecRefresher` for the
+# server-side implementation.
+RefreshCallback = Callable[
+    [OpenApiTool, "ToolExecutionError"], Awaitable["OpenApiTool | None"]
+]
 
 
 class ToolExecutionError(RuntimeError):
@@ -46,28 +75,141 @@ async def execute_tool(
     *,
     client: httpx.AsyncClient | None = None,
     forwarded_credentials: dict[str, str] | None = None,
+    refresh: RefreshCallback | None = None,
 ) -> ToolResult:
-    """Issue the HTTP request behind a tool call.
+    """Run a tool call.
 
-    Pass an ``httpx.AsyncClient`` to share a connection pool
-    across calls; one is created per-call otherwise.
+    For OpenAPI tools, ``client`` (an ``httpx.AsyncClient``) shares a
+    connection pool across calls; one is created per-call when not
+    provided.  Plugin tools ignore the HTTP-only kwargs.
+
+    ``refresh`` is an optional callback the executor consults after
+    a drift-shaped failure (currently HTTP 404 or 410) — see
+    :data:`DRIFT_STATUS_CODES`.  When it returns a tool object
+    distinct from the one we just tried, the executor retries once
+    against that tool.
     """
-    args = arguments or {}
+    if isinstance(tool, PluginTool):
+        return await _execute_plugin(tool, arguments or {})
+    return await _execute_openapi(
+        tool,
+        arguments or {},
+        client=client,
+        forwarded_credentials=forwarded_credentials,
+        refresh=refresh,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plugin dispatch
+# ---------------------------------------------------------------------------
+
+
+async def _execute_plugin(
+    tool: PluginTool,
+    arguments: dict[str, Any],
+) -> ToolResult:
+    """Call the Python handler.  Sync handlers run inline; coroutines
+    are awaited.  Any exception escapes as a :class:`ToolExecutionError`
+    so the MCP server's call_tool wrapper can surface it as text the
+    agent can react to."""
+    try:
+        result = tool.handler(**arguments)
+        if inspect.isawaitable(result):
+            result = await result
+    except TypeError as err:
+        # Most likely an argument-shape mismatch the agent supplied.
+        raise ToolExecutionError(
+            f"plugin '{tool.name}' rejected arguments: {err}",
+            status_code=None,
+        ) from err
+    except Exception as err:  # noqa: BLE001
+        raise ToolExecutionError(
+            f"plugin '{tool.name}' raised: {err}",
+            status_code=None,
+        ) from err
+
+    return ToolResult(status_code=200, body=result, headers={})
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI dispatch
+# ---------------------------------------------------------------------------
+
+
+async def _execute_openapi(
+    tool: OpenApiTool,
+    arguments: dict[str, Any],
+    *,
+    client: httpx.AsyncClient | None,
+    forwarded_credentials: dict[str, str] | None,
+    refresh: RefreshCallback | None = None,
+) -> ToolResult:
+    current = tool
+    while True:
+        try:
+            return await _execute_openapi_once(
+                current,
+                arguments,
+                client=client,
+                forwarded_credentials=forwarded_credentials,
+            )
+        except ToolExecutionError as err:
+            if (
+                refresh is None
+                or current.spec_url is None
+                or err.status_code not in DRIFT_STATUS_CODES
+            ):
+                raise
+            refreshed = await refresh(current, err)
+            if refreshed is None or refreshed is current:
+                raise
+            # Refresh produced a tool with a materially different
+            # execution shape — retry exactly once against that
+            # tool.  Clear ``refresh`` so a second drift-shaped
+            # failure surfaces instead of looping.
+            current = refreshed
+            refresh = None
+
+
+async def _execute_openapi_once(
+    tool: OpenApiTool,
+    arguments: dict[str, Any],
+    *,
+    client: httpx.AsyncClient | None,
+    forwarded_credentials: dict[str, str] | None,
+) -> ToolResult:
     auth = resolve_auth(tool.auth, forwarded_credentials=forwarded_credentials)
 
-    url, query, headers, body = _materialize_request(tool, args, auth)
+    url, query, headers, body = _materialize_request(tool, arguments, auth)
     timeout = tool.execution.timeout_seconds
+    method = tool.execution.method.upper()
+
+    # Some specs declare body-bearing methods (POST/PUT/PATCH/DELETE)
+    # without a requestBody.  If we then call httpx with `json=None`,
+    # it sends no body and *no* Content-Type/Content-Length headers —
+    # which a non-trivial number of upstreams reject as a protocol
+    # error ("411 Length Required" or similar).  For those methods,
+    # default to an empty JSON object so httpx attaches the proper
+    # Content-Type: application/json + Content-Length: 2 headers.
+    json_body: Any
+    if body is not None:
+        json_body = body
+    elif method in ("POST", "PUT", "PATCH", "DELETE"):
+        json_body = {}
+    else:
+        json_body = None
 
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=timeout)
     try:
         try:
             response = await client.request(
-                tool.execution.method.upper(),
+                method,
                 url,
                 params=query or None,
                 headers=headers or None,
-                json=body if body is not None else None,
+                json=json_body,
                 timeout=timeout,
             )
         except httpx.HTTPError as err:
@@ -94,7 +236,7 @@ async def execute_tool(
 
 
 def _materialize_request(
-    tool: ToolDefinition,
+    tool: OpenApiTool,
     arguments: dict[str, Any],
     auth: AppliedAuth,
 ) -> tuple[str, dict[str, str], dict[str, str], Any]:

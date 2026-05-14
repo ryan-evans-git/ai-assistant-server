@@ -16,6 +16,12 @@ RUN pip install --upgrade pip && pip install .
 COPY ai_assistant_server /app/ai_assistant_server
 COPY tools /app/tools
 
+# Run as non-root. uid 10001 is unprivileged + outside the
+# distro's reserved range (0-999 on Debian-based images).
+RUN groupadd --system --gid 10001 app && \
+    useradd --system --uid 10001 --gid app --no-create-home app
+USER app
+
 # Default: serve over SSE so the container is reachable from
 # other containers (stdio is great for local subprocess use,
 # but doesn't survive a container boundary).

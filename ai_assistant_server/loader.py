@@ -1,7 +1,7 @@
 """OpenAPI spec → tool definition loader.
 
 Walks a directory of .yaml / .yml / .json files, parses each as
-an OpenAPI document, and emits one :class:`ToolDefinition` per
+an OpenAPI document, and emits one :class:`OpenApiTool` per
 HTTP operation.
 
 Supports OpenAPI 3.0.x and 3.1.x.  Swagger 2.0 documents are
@@ -30,6 +30,7 @@ from the env var the user maps via ``AI_ASSISTANT_SERVER_AUTH_*``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -37,13 +38,16 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+import httpx
 import yaml
 
 from ai_assistant_server.models import (
     AuthConfig,
     AuthScheme,
+    HitlConfig,
     HttpExecution,
-    ToolDefinition,
+    OpenApiTool,
+    PluginTool,
 )
 
 
@@ -54,7 +58,7 @@ SUPPORTED_EXTENSIONS = (".yaml", ".yml", ".json")
 HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 
-def load_tools_from_directory(directory: str | Path) -> list[ToolDefinition]:
+def load_tools_from_directory(directory: str | Path) -> list[OpenApiTool]:
     """Load every spec under ``directory`` and return all derived tools.
 
     Files with unsupported extensions are skipped silently.
@@ -65,7 +69,7 @@ def load_tools_from_directory(directory: str | Path) -> list[ToolDefinition]:
     if not root.is_dir():
         raise ValueError(f"tools directory does not exist: {root}")
 
-    tools: list[ToolDefinition] = []
+    tools: list[OpenApiTool] = []
     seen_names: set[str] = set()
 
     for spec_path in sorted(root.iterdir()):
@@ -106,10 +110,11 @@ def _read_spec(path: Path) -> dict[str, Any]:
 
 def _tools_from_spec(
     spec: dict[str, Any], *, source: str
-) -> Iterable[ToolDefinition]:
+) -> Iterable[OpenApiTool]:
     base_url = _resolve_base_url(spec)
     security_schemes = _security_schemes(spec)
     document_security = spec.get("security", []) or []
+    spec_url = _extract_spec_url(spec)
 
     paths = spec.get("paths") or {}
     for path, path_item in paths.items():
@@ -132,7 +137,82 @@ def _tools_from_spec(
                 security_schemes=security_schemes,
                 document_security=document_security,
                 source=source,
+                spec_url=spec_url,
             )
+
+
+def tools_from_spec_doc(
+    spec: dict[str, Any], *, source: str = ""
+) -> list[OpenApiTool]:
+    """Convert an already-parsed OpenAPI document into tools.
+
+    Public counterpart to the private ``_tools_from_spec`` iterator
+    for callers that already hold an in-memory spec dict — notably
+    :class:`ai_assistant_server.refresher.SpecRefresher`, which
+    re-parses a live spec after a drift-shaped failure.  Name
+    collisions inside a single spec are disambiguated with ``_2``
+    / ``_3`` suffixes, matching :func:`load_tools_from_directory`.
+    """
+    seen: set[str] = set()
+    out: list[OpenApiTool] = []
+    for tool in _tools_from_spec(spec, source=source):
+        tool = _disambiguate_name(tool, seen)
+        out.append(tool)
+        seen.add(tool.name)
+    return out
+
+
+def _extract_spec_url(spec: dict[str, Any]) -> str | None:
+    """Read the optional ``x-aai-spec-url`` pointer off a spec doc.
+
+    Accepted at the document root (``x-aai-spec-url``) or under
+    ``info`` (``info.x-aai-spec-url``).  This is the URL the runtime
+    refresher will re-fetch when an upstream call fails in a way
+    that suggests the on-disk spec is stale.  Returns ``None`` when
+    the extension is absent or empty.
+    """
+    val = spec.get("x-aai-spec-url")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    info = spec.get("info") or {}
+    if isinstance(info, dict):
+        nested = info.get("x-aai-spec-url")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def spec_hash(spec: dict[str, Any]) -> str:
+    """Stable SHA-256 of a parsed spec for change detection.
+
+    The refresher uses this to skip a retry when the live spec is
+    byte-equivalent to what we last loaded — the request would just
+    fail the same way and we'd hammer the upstream for nothing.
+    """
+    canonical = json.dumps(spec, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def fetch_spec_from_url(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Fetch a spec document from an http(s) URL and parse it.
+
+    Content-Type drives the parser choice (``application/json`` →
+    JSON, anything else → YAML, which also accepts JSON).  Network
+    and parse errors propagate to the caller — the refresher logs
+    and treats them as "no refresh available."
+    """
+    response = await client.get(url, timeout=timeout)
+    response.raise_for_status()
+    text = response.text
+    ctype = response.headers.get("content-type", "").lower()
+    if "json" in ctype or url.lower().split("?")[0].endswith(".json"):
+        return json.loads(text)
+    return yaml.safe_load(text)
 
 
 def _build_tool(
@@ -145,7 +225,8 @@ def _build_tool(
     security_schemes: dict[str, dict[str, Any]],
     document_security: list[Any],
     source: str,
-) -> ToolDefinition:
+    spec_url: str | None = None,
+) -> OpenApiTool:
     name = _tool_name(operation, method, path)
     description = _tool_description(operation)
     parameters = list(path_level_parameters) + list(
@@ -168,8 +249,9 @@ def _build_tool(
     )
     tags_raw = operation.get("tags") or []
     tags: tuple[str, ...] = tuple(str(t) for t in tags_raw if isinstance(t, str))
+    hitl = _hitl_from_operation(operation)
 
-    return ToolDefinition(
+    return OpenApiTool(
         name=name,
         description=description,
         input_schema=input_schema,
@@ -177,6 +259,53 @@ def _build_tool(
         auth=auth,
         tags=tags,
         source_spec=source,
+        hitl=hitl,
+        spec_url=spec_url,
+    )
+
+
+def _hitl_from_operation(operation: dict[str, Any]) -> HitlConfig:
+    """Read ``x-aai-*`` HITL vendor extensions off an OpenAPI op.
+
+    Two surface forms supported:
+
+    * Flat: ``x-aai-requires-confirmation: true`` /
+      ``x-aai-confirm-timeout-seconds: 30`` /
+      ``x-aai-confirm-message: "Send email?"``
+    * Nested: ``x-aai-hitl: {requires_confirmation: true, ...}`` for
+      authors who prefer to group the keys.
+
+    Unrecognized values fall back to defaults; we never raise from
+    a malformed extension — the OpenAPI spec is otherwise valid.
+    """
+    nested = operation.get("x-aai-hitl") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+
+    def _flag(flat_key: str, nested_key: str, default: Any) -> Any:
+        if flat_key in operation:
+            return operation[flat_key]
+        if nested_key in nested:
+            return nested[nested_key]
+        return default
+
+    requires = bool(
+        _flag("x-aai-requires-confirmation", "requires_confirmation", False)
+    )
+    timeout = _flag("x-aai-confirm-timeout-seconds", "timeout_seconds", None)
+    message = _flag("x-aai-confirm-message", "confirm_message", None)
+
+    timeout_int: int | None
+    try:
+        timeout_int = int(timeout) if timeout is not None else None
+    except (TypeError, ValueError):
+        timeout_int = None
+    message_str = str(message) if message is not None else None
+
+    return HitlConfig(
+        requires_confirmation=requires,
+        timeout_seconds=timeout_int,
+        confirm_message=message_str,
     )
 
 
@@ -207,14 +336,14 @@ def _slugify(value: str) -> str:
     return cleaned.lower()
 
 
-def _disambiguate_name(tool: ToolDefinition, seen: set[str]) -> ToolDefinition:
+def _disambiguate_name(tool: OpenApiTool, seen: set[str]) -> OpenApiTool:
     if tool.name not in seen:
         return tool
     n = 2
     while f"{tool.name}_{n}" in seen:
         n += 1
     new_name = f"{tool.name}_{n}"
-    return ToolDefinition(
+    return OpenApiTool(
         name=new_name,
         description=tool.description,
         input_schema=tool.input_schema,
@@ -222,6 +351,8 @@ def _disambiguate_name(tool: ToolDefinition, seen: set[str]) -> ToolDefinition:
         auth=tool.auth,
         tags=tool.tags,
         source_spec=tool.source_spec,
+        hitl=tool.hitl,
+        spec_url=tool.spec_url,
     )
 
 
@@ -439,3 +570,82 @@ def _env_for(scheme_name: str) -> str:
     """
     cleaned = re.sub(r"[^A-Z0-9]", "_", scheme_name.upper())
     return f"AI_ASSISTANT_SERVER_AUTH_{cleaned}"
+
+
+# ---------------------------------------------------------------------------
+# Python plugin loading
+# ---------------------------------------------------------------------------
+
+
+def load_plugins_from_module(module_path: str) -> list[PluginTool]:
+    """Import ``module_path`` (dotted form, e.g. ``my_pkg.tools``) and
+    return every :class:`PluginTool` registered in it via the ``@tool``
+    decorator.
+
+    Raises :class:`ImportError` propagated from ``importlib`` when the
+    target module can't be imported — the server's startup logs that
+    and exits with a clear error rather than silently skipping.
+    """
+    import importlib
+
+    from ai_assistant_server.plugins import get_plugin_tool
+
+    module = importlib.import_module(module_path)
+    plugins: list[PluginTool] = []
+    for attr_name in dir(module):
+        obj = getattr(module, attr_name)
+        plugin = get_plugin_tool(obj)
+        if plugin is not None:
+            plugins.append(plugin)
+    log.info(
+        "Loaded %d plugin tool(s) from module %s", len(plugins), module_path
+    )
+    return plugins
+
+
+def load_plugins_from_directory(directory: str | Path) -> list[PluginTool]:
+    """Import every ``*.py`` file under ``directory`` and return all
+    decorated :class:`PluginTool` instances found across them.
+
+    Files starting with ``_`` are skipped (so ``__init__.py`` and
+    ``_helpers.py`` style modules don't pull in side-effect imports
+    twice).  Each file is loaded as a freestanding module — the
+    directory does *not* need an ``__init__.py``.  Tests that need
+    importable plugin modules should still use
+    :func:`load_plugins_from_module`.
+    """
+    import importlib.util
+    import sys
+
+    from ai_assistant_server.plugins import get_plugin_tool
+
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+
+    plugins: list[PluginTool] = []
+    for path in sorted(root.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        # Use a synthetic module name namespaced under the directory
+        # so multiple plugin dirs don't collide in sys.modules.
+        mod_name = f"_aai_plugin_{root.name}_{path.stem}"
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            log.warning("Could not load plugin file %s", path)
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as err:  # noqa: BLE001
+            log.warning("Skipping plugin file %s: %s", path.name, err)
+            del sys.modules[mod_name]
+            continue
+        for attr_name in dir(module):
+            obj = getattr(module, attr_name)
+            plugin = get_plugin_tool(obj)
+            if plugin is not None:
+                plugins.append(plugin)
+    log.info("Loaded %d plugin tool(s) from %s", len(plugins), root)
+    return plugins

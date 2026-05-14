@@ -1,17 +1,22 @@
-"""Data models shared by the loader, executor, and server.
+"""Data models shared by the loader, executor, plugins, and server.
 
-These are deliberately minimal — they describe what an MCP tool
-*derived from* an OpenAPI operation looks like, not the full
-OpenAPI surface.  The loader is the only place that knows about
-the OpenAPI document structure; downstream code only sees these
-types.
+A :class:`ToolDefinition` is the base shape every tool the server
+surfaces conforms to: ``name`` + ``description`` + ``input_schema``
+(JSON Schema).  Beyond that we have two concrete subclasses:
+
+  * :class:`OpenApiTool` — derived from an OpenAPI/Swagger operation
+    and dispatched via an HTTP request.
+  * :class:`PluginTool` — a Python callable registered via the
+    ``@tool`` decorator (see :mod:`ai_assistant_server.plugins`).
+
+The executor dispatches on type at call time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Awaitable, Callable, Union
 
 
 class AuthScheme(str, Enum):
@@ -34,7 +39,7 @@ class AuthScheme(str, Enum):
 
 @dataclass(frozen=True)
 class AuthConfig:
-    """Resolved auth requirement for a single tool.
+    """Resolved auth requirement for a single OpenAPI-derived tool.
 
     ``scheme`` is the *kind* of auth.  ``secret_env`` is the
     environment variable the executor will read at call time —
@@ -53,7 +58,7 @@ class AuthConfig:
 
 @dataclass(frozen=True)
 class HttpExecution:
-    """How to issue the HTTP request behind a tool call.
+    """How to issue the HTTP request behind an OpenAPI tool call.
 
     ``base_url`` comes from the spec's first ``servers[]`` entry
     (or an env override).  ``path`` and ``method`` are the
@@ -71,14 +76,44 @@ class HttpExecution:
     timeout_seconds: float = 30.0
 
 
-@dataclass(frozen=True)
-class ToolDefinition:
-    """A single tool surfaced to the MCP client.
+# ---------------------------------------------------------------------------
+# Human-in-the-loop config
+# ---------------------------------------------------------------------------
 
-    The shape mirrors what MCP wants on the wire: ``name`` +
-    ``description`` + ``input_schema`` (JSON Schema).  Beyond
-    that we carry an ``execution`` block + ``auth`` block so the
-    executor can dispatch the call without re-parsing the spec.
+
+@dataclass(frozen=True)
+class HitlConfig:
+    """Per-tool human-in-the-loop policy.
+
+    Default-off: a tool that doesn't set any of these fields runs
+    exactly as before — no confirmation, no pause.  When
+    ``requires_confirmation`` is ``True`` the metadata travels to
+    the client (via MCP ``Tool.annotations``) and the agent loop
+    pauses before dispatch to surface a confirm/decline modal.
+
+    ``confirm_message`` is an optional one-line UI hint shown above
+    the JSON-formatted tool input.  ``timeout_seconds`` lets the
+    tool author override the client-side default timeout (e.g. a
+    long-running review can ask for 5 minutes).
+    """
+
+    requires_confirmation: bool = False
+    timeout_seconds: int | None = None
+    confirm_message: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OpenApiTool:
+    """A tool derived from an OpenAPI operation.
+
+    Carries both the wire surface (``name``/``description``/
+    ``input_schema``) and the dispatch metadata the executor needs
+    to issue the upstream HTTP request.
     """
 
     name: str
@@ -90,3 +125,35 @@ class ToolDefinition:
     # for progressive discovery on the client side.
     tags: tuple[str, ...] = field(default_factory=tuple)
     source_spec: str = ""
+    hitl: HitlConfig = field(default_factory=HitlConfig)
+    # Optional pointer back to a live OpenAPI document the server can
+    # re-fetch when an upstream call fails in a way that suggests the
+    # on-disk spec is stale (see :mod:`ai_assistant_server.refresher`).
+    # Sourced from the ``x-aai-spec-url`` extension on the spec doc.
+    spec_url: str | None = None
+
+
+# A plugin handler is an async- or sync-callable that takes the
+# parsed argument dict and returns the result body.  The executor
+# awaits awaitable returns; sync callables run inline.
+PluginHandler = Callable[..., Union[Any, Awaitable[Any]]]
+
+
+@dataclass(frozen=True)
+class PluginTool:
+    """A tool registered via the ``@tool`` decorator from a Python
+    callable.  The input schema is derived from the callable's
+    signature at registration time."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: PluginHandler
+    tags: tuple[str, ...] = field(default_factory=tuple)
+    source_module: str = ""
+    hitl: HitlConfig = field(default_factory=HitlConfig)
+
+
+# Public alias so callers don't have to spell out the union every
+# time.  Either subclass satisfies "the wire surface MCP needs."
+ToolDefinition = Union[OpenApiTool, PluginTool]

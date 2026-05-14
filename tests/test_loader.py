@@ -8,11 +8,17 @@ from pathlib import Path
 
 import pytest
 
+import httpx
+
 from ai_assistant_server.loader import (
+    _extract_spec_url,
     _resolve_base_url,
     _slugify,
     _tool_name,
+    fetch_spec_from_url,
     load_tools_from_directory,
+    spec_hash,
+    tools_from_spec_doc,
 )
 from ai_assistant_server.models import AuthScheme
 
@@ -351,3 +357,129 @@ def test_request_body_lifted_into_schema(tmp_path: Path) -> None:
     body_schema = create.input_schema["properties"]["body"]
     assert body_schema["type"] == "object"
     assert body_schema["required"] == ["name"]
+
+
+# ---------------------------------------------------------------------------
+# x-aai-spec-url + runtime spec helpers
+# ---------------------------------------------------------------------------
+
+
+def test_extract_spec_url_root_extension() -> None:
+    spec = {"x-aai-spec-url": "https://api.example.com/openapi.json"}
+    assert _extract_spec_url(spec) == "https://api.example.com/openapi.json"
+
+
+def test_extract_spec_url_info_extension() -> None:
+    spec = {"info": {"x-aai-spec-url": "https://api.example.com/v3/api-docs"}}
+    assert _extract_spec_url(spec) == "https://api.example.com/v3/api-docs"
+
+
+def test_extract_spec_url_absent_returns_none() -> None:
+    assert _extract_spec_url({"info": {}}) is None
+
+
+def test_extract_spec_url_root_wins_over_info() -> None:
+    spec = {
+        "x-aai-spec-url": "https://root.example/spec",
+        "info": {"x-aai-spec-url": "https://info.example/spec"},
+    }
+    assert _extract_spec_url(spec) == "https://root.example/spec"
+
+
+def test_extract_spec_url_blank_string_is_ignored() -> None:
+    spec = {"x-aai-spec-url": "   "}
+    assert _extract_spec_url(spec) is None
+
+
+def test_extract_spec_url_non_dict_info_is_ignored() -> None:
+    # Malformed specs shouldn't crash the loader.
+    assert _extract_spec_url({"info": "not-a-dict"}) is None
+
+
+def test_load_propagates_spec_url(tmp_path: Path) -> None:
+    spec_with_url = textwrap.dedent(
+        """
+        openapi: 3.0.3
+        x-aai-spec-url: https://api.example.com/openapi.json
+        info:
+          title: x
+          version: 1.0.0
+        servers:
+          - url: https://api.example.com
+        paths:
+          /ping:
+            get:
+              operationId: ping
+              responses:
+                "200":
+                  description: ok
+        """
+    )
+    _write_spec(tmp_path, "ping.yaml", spec_with_url)
+    tools = load_tools_from_directory(tmp_path)
+    assert tools[0].spec_url == "https://api.example.com/openapi.json"
+
+
+def test_spec_hash_is_stable_and_ordering_invariant() -> None:
+    a = {"a": 1, "b": [2, 3], "nested": {"x": True, "y": None}}
+    b = {"nested": {"y": None, "x": True}, "b": [2, 3], "a": 1}
+    assert spec_hash(a) == spec_hash(b)
+
+
+def test_spec_hash_changes_with_content() -> None:
+    a = {"paths": {"/x": {"get": {}}}}
+    b = {"paths": {"/y": {"get": {}}}}
+    assert spec_hash(a) != spec_hash(b)
+
+
+def test_tools_from_spec_doc_disambiguates_collisions() -> None:
+    spec = {
+        "paths": {
+            "/a": {"get": {"operationId": "getThing", "responses": {}}},
+            "/b": {"get": {"operationId": "getThing", "responses": {}}},
+        }
+    }
+    tools = tools_from_spec_doc(spec, source="live")
+    names = sorted(t.name for t in tools)
+    assert names == ["getthing", "getthing_2"]
+
+
+async def test_fetch_spec_from_url_json_content_type() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            text='{"openapi": "3.0.0", "paths": {}}',
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        spec = await fetch_spec_from_url(
+            "https://api.example.com/openapi.json", client=client
+        )
+    assert spec == {"openapi": "3.0.0", "paths": {}}
+
+
+async def test_fetch_spec_from_url_yaml_fallback() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/yaml"},
+            text="openapi: 3.0.0\npaths: {}\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        spec = await fetch_spec_from_url(
+            "https://api.example.com/openapi.yaml", client=client
+        )
+    assert spec == {"openapi": "3.0.0", "paths": {}}
+
+
+async def test_fetch_spec_from_url_raises_on_http_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="bad day")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_spec_from_url(
+                "https://api.example.com/openapi.json", client=client
+            )

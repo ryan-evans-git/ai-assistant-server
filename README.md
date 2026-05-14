@@ -124,6 +124,31 @@ The flag rides through MCP via `Tool.annotations.aai` and is
 honored by any HITL-aware client. See `plugins/sample_hitl.py` and
 `tools/billing-hitl.yaml` for runnable examples.
 
+## Self-healing on spec drift
+
+The on-disk OpenAPI file is the pinned source of truth, but a running
+API can move out from under it (renamed paths, dropped operations).
+Add an `x-aai-spec-url` extension pointing at the live spec — at the
+document root or under `info` — and the server will re-fetch it
+**only** when an upstream call fails in a way that suggests drift
+(HTTP 404 or 410 on a known operation), then retry the call once
+against the refreshed shape.
+
+```yaml
+openapi: 3.0.3
+x-aai-spec-url: https://api.example.com/openapi.json
+info:
+  title: Sample
+  version: 1.0.0
+```
+
+Conservative on purpose: 5xx / timeouts / auth / rate-limit errors
+do not trigger a refresh; a fetch that returns a byte-equivalent
+spec is treated as "no change" and skips the retry; per-URL
+cooldown caps refresh attempts to one per minute. The pinned file
+is never written to from runtime — reconciling drift back into the
+repo is a separate, deliberate step.
+
 ## Install
 
 ```bash

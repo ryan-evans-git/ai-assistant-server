@@ -30,6 +30,7 @@ from the env var the user maps via ``AI_ASSISTANT_SERVER_AUTH_*``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -37,11 +38,13 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+import httpx
 import yaml
 
 from ai_assistant_server.models import (
     AuthConfig,
     AuthScheme,
+    HitlConfig,
     HttpExecution,
     OpenApiTool,
     PluginTool,
@@ -111,6 +114,7 @@ def _tools_from_spec(
     base_url = _resolve_base_url(spec)
     security_schemes = _security_schemes(spec)
     document_security = spec.get("security", []) or []
+    spec_url = _extract_spec_url(spec)
 
     paths = spec.get("paths") or {}
     for path, path_item in paths.items():
@@ -133,7 +137,82 @@ def _tools_from_spec(
                 security_schemes=security_schemes,
                 document_security=document_security,
                 source=source,
+                spec_url=spec_url,
             )
+
+
+def tools_from_spec_doc(
+    spec: dict[str, Any], *, source: str = ""
+) -> list[OpenApiTool]:
+    """Convert an already-parsed OpenAPI document into tools.
+
+    Public counterpart to the private ``_tools_from_spec`` iterator
+    for callers that already hold an in-memory spec dict — notably
+    :class:`ai_assistant_server.refresher.SpecRefresher`, which
+    re-parses a live spec after a drift-shaped failure.  Name
+    collisions inside a single spec are disambiguated with ``_2``
+    / ``_3`` suffixes, matching :func:`load_tools_from_directory`.
+    """
+    seen: set[str] = set()
+    out: list[OpenApiTool] = []
+    for tool in _tools_from_spec(spec, source=source):
+        tool = _disambiguate_name(tool, seen)
+        out.append(tool)
+        seen.add(tool.name)
+    return out
+
+
+def _extract_spec_url(spec: dict[str, Any]) -> str | None:
+    """Read the optional ``x-aai-spec-url`` pointer off a spec doc.
+
+    Accepted at the document root (``x-aai-spec-url``) or under
+    ``info`` (``info.x-aai-spec-url``).  This is the URL the runtime
+    refresher will re-fetch when an upstream call fails in a way
+    that suggests the on-disk spec is stale.  Returns ``None`` when
+    the extension is absent or empty.
+    """
+    val = spec.get("x-aai-spec-url")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    info = spec.get("info") or {}
+    if isinstance(info, dict):
+        nested = info.get("x-aai-spec-url")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def spec_hash(spec: dict[str, Any]) -> str:
+    """Stable SHA-256 of a parsed spec for change detection.
+
+    The refresher uses this to skip a retry when the live spec is
+    byte-equivalent to what we last loaded — the request would just
+    fail the same way and we'd hammer the upstream for nothing.
+    """
+    canonical = json.dumps(spec, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def fetch_spec_from_url(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Fetch a spec document from an http(s) URL and parse it.
+
+    Content-Type drives the parser choice (``application/json`` →
+    JSON, anything else → YAML, which also accepts JSON).  Network
+    and parse errors propagate to the caller — the refresher logs
+    and treats them as "no refresh available."
+    """
+    response = await client.get(url, timeout=timeout)
+    response.raise_for_status()
+    text = response.text
+    ctype = response.headers.get("content-type", "").lower()
+    if "json" in ctype or url.lower().split("?")[0].endswith(".json"):
+        return json.loads(text)
+    return yaml.safe_load(text)
 
 
 def _build_tool(
@@ -146,6 +225,7 @@ def _build_tool(
     security_schemes: dict[str, dict[str, Any]],
     document_security: list[Any],
     source: str,
+    spec_url: str | None = None,
 ) -> OpenApiTool:
     name = _tool_name(operation, method, path)
     description = _tool_description(operation)
@@ -169,6 +249,7 @@ def _build_tool(
     )
     tags_raw = operation.get("tags") or []
     tags: tuple[str, ...] = tuple(str(t) for t in tags_raw if isinstance(t, str))
+    hitl = _hitl_from_operation(operation)
 
     return OpenApiTool(
         name=name,
@@ -178,6 +259,53 @@ def _build_tool(
         auth=auth,
         tags=tags,
         source_spec=source,
+        hitl=hitl,
+        spec_url=spec_url,
+    )
+
+
+def _hitl_from_operation(operation: dict[str, Any]) -> HitlConfig:
+    """Read ``x-aai-*`` HITL vendor extensions off an OpenAPI op.
+
+    Two surface forms supported:
+
+    * Flat: ``x-aai-requires-confirmation: true`` /
+      ``x-aai-confirm-timeout-seconds: 30`` /
+      ``x-aai-confirm-message: "Send email?"``
+    * Nested: ``x-aai-hitl: {requires_confirmation: true, ...}`` for
+      authors who prefer to group the keys.
+
+    Unrecognized values fall back to defaults; we never raise from
+    a malformed extension — the OpenAPI spec is otherwise valid.
+    """
+    nested = operation.get("x-aai-hitl") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+
+    def _flag(flat_key: str, nested_key: str, default: Any) -> Any:
+        if flat_key in operation:
+            return operation[flat_key]
+        if nested_key in nested:
+            return nested[nested_key]
+        return default
+
+    requires = bool(
+        _flag("x-aai-requires-confirmation", "requires_confirmation", False)
+    )
+    timeout = _flag("x-aai-confirm-timeout-seconds", "timeout_seconds", None)
+    message = _flag("x-aai-confirm-message", "confirm_message", None)
+
+    timeout_int: int | None
+    try:
+        timeout_int = int(timeout) if timeout is not None else None
+    except (TypeError, ValueError):
+        timeout_int = None
+    message_str = str(message) if message is not None else None
+
+    return HitlConfig(
+        requires_confirmation=requires,
+        timeout_seconds=timeout_int,
+        confirm_message=message_str,
     )
 
 
@@ -223,6 +351,8 @@ def _disambiguate_name(tool: OpenApiTool, seen: set[str]) -> OpenApiTool:
         auth=tool.auth,
         tags=tool.tags,
         source_spec=tool.source_spec,
+        hitl=tool.hitl,
+        spec_url=tool.spec_url,
     )
 
 
